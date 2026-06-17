@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+
+# 打包产物
+dist/
+build/
+
+# 测试 / 类型检查缓存
+.pytest_cache/
+.mypy_cache/
+
+# 审查报告（保留目录占位，忽略生成的 .md）
+.review-reports/*.md
+
+# agent-config
+.workbuddy

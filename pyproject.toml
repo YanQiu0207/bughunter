@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bughunter"
+version = "0.1.0"
+description = "把报错堆栈交给大模型，自主检索本地代码后给出根因与优化建议。"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "bughunter" }]
+keywords = ["debug", "llm", "code-review", "function-calling"]
+dependencies = []
+
+[project.scripts]
+bughunter = "bughunter.cli:main"
+
+[tool.setuptools]
+packages = ["bughunter"]
