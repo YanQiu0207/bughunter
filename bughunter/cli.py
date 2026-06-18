@@ -8,15 +8,29 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .agent import analyze, propose_fix
+from .agent import analyze, generate_tests, propose_fix
 from .config import Settings
-from .patch import apply_edits
+from .patch import apply_and_test, apply_edits, restore_backup
 from .report import to_dict, to_markdown
 from .runner import run_command
-from .schema import build_fix_proposal, build_test_proposal
+from .schema import (
+    FixProposal,
+    TestProposal,
+    build_fix_proposal,
+    build_result,
+    build_test_proposal,
+)
 
 _MAX_STACK_BYTES = 65_536
-_COMMANDS = {"analyze", "propose-fix", "apply", "run"}
+_COMMANDS = {
+    "analyze",
+    "propose-fix",
+    "generate-tests",
+    "apply",
+    "run",
+    "apply-and-test",
+    "restore",
+}
 
 
 def _build_settings(args: argparse.Namespace) -> Settings | None:
@@ -96,6 +110,18 @@ def _load_json_file(path: str) -> dict[str, Any]:
     return data
 
 
+def _read_text_file(path: str, label: str) -> str:
+    file_path = Path(path)
+    if not file_path.exists():
+        raise SystemExit(f"错误：{label} 文件不存在：{path}")
+    return file_path.read_text(encoding="utf-8")
+
+
+def _load_proposal_file(path: str, kind: str) -> FixProposal | TestProposal:
+    raw = _load_json_file(path)
+    return build_fix_proposal(raw) if kind == "fix" else build_test_proposal(raw)
+
+
 def _settings_from_env_or_args(args: argparse.Namespace) -> Settings:
     settings = Settings.command_from_env()
     if args.base_url and args.model:
@@ -119,7 +145,25 @@ def _command_parser() -> argparse.ArgumentParser:
     propose_parser = sub.add_parser("propose-fix", help="生成修复方案 JSON")
     propose_parser.add_argument("--repo", required=True)
     propose_parser.add_argument("--stack-file")
+    propose_parser.add_argument(
+        "--analysis",
+        help="上一阶段 analyze 产出的 JSON 文件",
+    )
+    propose_parser.add_argument(
+        "--test-output",
+        help="上一轮 run 产出的结果文件或原始测试输出",
+    )
     _add_llm_args(propose_parser)
+
+    tests_parser = sub.add_parser("generate-tests", help="生成测试方案 JSON")
+    tests_parser.add_argument("--repo", required=True)
+    tests_parser.add_argument(
+        "--proposal",
+        required=True,
+        help="上一阶段生成的 proposal JSON",
+    )
+    tests_parser.add_argument("--kind", choices=("fix", "tests"), default="fix")
+    _add_llm_args(tests_parser)
 
     apply_parser = sub.add_parser("apply", help="应用已确认的 proposal JSON")
     apply_parser.add_argument("--repo", required=True)
@@ -130,6 +174,20 @@ def _command_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--repo", required=True)
     run_parser.add_argument("--name", required=True)
     _add_llm_args(run_parser)
+
+    apply_test_parser = sub.add_parser(
+        "apply-and-test",
+        help="应用 proposal 后执行白名单命令",
+    )
+    apply_test_parser.add_argument("--repo", required=True)
+    apply_test_parser.add_argument("--proposal", required=True)
+    apply_test_parser.add_argument("--kind", choices=("fix", "tests"), default="fix")
+    apply_test_parser.add_argument("--name", default="test")
+    _add_llm_args(apply_test_parser)
+
+    restore_parser = sub.add_parser("restore", help="按备份路径恢复文件")
+    restore_parser.add_argument("--repo", required=True)
+    restore_parser.add_argument("--backup-path", required=True)
     return parser
 
 
@@ -137,23 +195,54 @@ def _run_command_mode(args: argparse.Namespace) -> int:
     if args.command == "analyze":
         return _run_analyze(args)
     if args.command == "propose-fix":
+        analysis = None
+        if args.analysis:
+            analysis = build_result(_load_json_file(args.analysis))
+        test_output = None
+        if args.test_output:
+            test_output = _read_text_file(args.test_output, "--test-output")
         proposal = propose_fix(
             _read_stack(args.stack_file),
             args.repo,
+            analysis=analysis,
+            test_output=test_output,
             settings=_build_settings(args),
             max_steps=args.max_steps,
         )
         print(json.dumps(to_dict(proposal), ensure_ascii=False, indent=2))
         return 0
+    if args.command == "generate-tests":
+        proposal = _load_proposal_file(args.proposal, args.kind)
+        tests = generate_tests(
+            args.repo,
+            proposal=proposal,
+            settings=_build_settings(args),
+            max_steps=args.max_steps,
+        )
+        print(json.dumps(to_dict(tests), ensure_ascii=False, indent=2))
+        return 0
     if args.command == "apply":
-        raw = _load_json_file(args.proposal)
-        proposal = build_fix_proposal(raw) if args.kind == "fix" else build_test_proposal(raw)
+        proposal = _load_proposal_file(args.proposal, args.kind)
         result = apply_edits(proposal, args.repo)
         print(json.dumps(to_dict(result), ensure_ascii=False, indent=2))
         return 0
     if args.command == "run":
         result = run_command(args.name, args.repo, _settings_from_env_or_args(args))
         print(json.dumps(to_dict(result), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "apply-and-test":
+        proposal = _load_proposal_file(args.proposal, args.kind)
+        result = apply_and_test(
+            proposal,
+            args.repo,
+            _settings_from_env_or_args(args),
+            test_name=args.name,
+        )
+        print(json.dumps(to_dict(result), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "restore":
+        restore_backup(args.repo, args.backup_path)
+        print(json.dumps({"restored": True}, ensure_ascii=False, indent=2))
         return 0
     raise SystemExit(f"未知子命令：{args.command}")
 

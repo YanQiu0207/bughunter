@@ -7,15 +7,20 @@ import os
 import tempfile
 import unittest
 import unittest.mock
+from dataclasses import asdict
 from pathlib import Path
 
 from bughunter.config import ENV_ALLOWED_COMMANDS
 from bughunter.schema import (
     AnalysisResult,
+    ApplyAndTestResult,
+    ApplyResult,
     CodeReference,
+    CommandResult,
     FileEdit,
     FixProposal,
     Suggestion,
+    TestProposal,
 )
 
 _FAKE_RESULT = AnalysisResult(
@@ -29,6 +34,12 @@ _FAKE_RESULT = AnalysisResult(
 _FAKE_FIX = FixProposal(
     summary="修复缺键",
     edits=[FileEdit("app.py", "edit", "a", "b", "r")],
+    confidence="high",
+)
+
+_FAKE_TESTS = TestProposal(
+    summary="覆盖缺键场景",
+    edits=[FileEdit("tests/test_app.py", "create", "", "def test_x(): pass\n", "r")],
     confidence="high",
 )
 
@@ -139,6 +150,74 @@ class CLINewCommandsTest(unittest.TestCase):
         parsed = json.loads(out)
         self.assertEqual(parsed["edits"][0]["path"], "app.py")
 
+    def test_propose_fix_subcommand_passes_previous_outputs(self) -> None:
+        analysis_file = Path(self._tmp.name) / "analysis.json"
+        analysis_file.write_text(
+            json.dumps(
+                {
+                    "summary": "s",
+                    "root_cause": "r",
+                    "suggestions": [],
+                    "confidence": "high",
+                }
+            ),
+            encoding="utf-8",
+        )
+        test_output_file = Path(self._tmp.name) / "test-output.txt"
+        test_output_file.write_text("FAILED tests/test_app.py", encoding="utf-8")
+
+        def fake_propose_fix(*args, **kwargs):
+            self.assertEqual(kwargs["analysis"].summary, "s")
+            self.assertEqual(kwargs["test_output"], "FAILED tests/test_app.py")
+            return _FAKE_FIX
+
+        with unittest.mock.patch(
+            "bughunter.cli.propose_fix",
+            side_effect=fake_propose_fix,
+        ):
+            code, out = _run(
+                [
+                    "propose-fix",
+                    "--repo",
+                    self.repo,
+                    "--stack-file",
+                    str(self.stack_file),
+                    "--analysis",
+                    str(analysis_file),
+                    "--test-output",
+                    str(test_output_file),
+                ]
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["summary"], "修复缺键")
+
+    def test_generate_tests_subcommand_uses_previous_proposal(self) -> None:
+        proposal_file = Path(self._tmp.name) / "fix.json"
+        proposal_file.write_text(
+            json.dumps(asdict(_FAKE_FIX)),
+            encoding="utf-8",
+        )
+
+        def fake_generate_tests(*args, **kwargs):
+            self.assertEqual(kwargs["proposal"].summary, "修复缺键")
+            return _FAKE_TESTS
+
+        with unittest.mock.patch(
+            "bughunter.cli.generate_tests",
+            side_effect=fake_generate_tests,
+        ):
+            code, out = _run(
+                [
+                    "generate-tests",
+                    "--repo",
+                    self.repo,
+                    "--proposal",
+                    str(proposal_file),
+                ]
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["edits"][0]["path"], "tests/test_app.py")
+
     def test_run_subcommand_uses_command_env_without_llm_env(self) -> None:
         os.environ[ENV_ALLOWED_COMMANDS] = '{"echo": ["python", "-c", "print(123)"]}'
         code, out = _run(["run", "--repo", self.repo, "--name", "echo"])
@@ -146,6 +225,54 @@ class CLINewCommandsTest(unittest.TestCase):
         parsed = json.loads(out)
         self.assertEqual(parsed["exit_code"], 0)
         self.assertIn("123", parsed["stdout"])
+
+    def test_apply_and_test_subcommand_outputs_json(self) -> None:
+        proposal_file = Path(self._tmp.name) / "fix.json"
+        proposal_file.write_text(
+            json.dumps(asdict(_FAKE_FIX)),
+            encoding="utf-8",
+        )
+        fake_result = ApplyAndTestResult(
+            apply_result=ApplyResult(applied=["app.py"], backup_path=".backup"),
+            command_result=CommandResult(
+                name="test",
+                exit_code=0,
+                stdout="ok",
+                stderr="",
+            ),
+        )
+        with unittest.mock.patch(
+            "bughunter.cli.apply_and_test",
+            return_value=fake_result,
+        ):
+            code, out = _run(
+                [
+                    "apply-and-test",
+                    "--repo",
+                    self.repo,
+                    "--proposal",
+                    str(proposal_file),
+                    "--name",
+                    "test",
+                ]
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["command_result"]["exit_code"], 0)
+
+    def test_restore_subcommand_calls_restore_backup(self) -> None:
+        with unittest.mock.patch("bughunter.cli.restore_backup") as mock_restore:
+            code, out = _run(
+                [
+                    "restore",
+                    "--repo",
+                    self.repo,
+                    "--backup-path",
+                    ".bughunter_backups/1",
+                ]
+            )
+        self.assertEqual(code, 0)
+        mock_restore.assert_called_once_with(self.repo, ".bughunter_backups/1")
+        self.assertTrue(json.loads(out)["restored"])
 
 
 if __name__ == "__main__":
