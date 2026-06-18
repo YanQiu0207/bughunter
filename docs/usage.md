@@ -139,6 +139,118 @@ result = analyze(stack_trace, repo_path="/path/to/repo", llm=MyClient())
 
 接口定义、`ChatResponse` / `ToolCall` 中立模型见 `bughunter/llm.py`，设计说明见 [design.md](design.md)。
 
+## 8. 修复 - 应用 - 测试闭环
+
+调用方系统可以把 `bughunter` 当作一组无状态能力接口使用，人工确认和阶段串联由调用方系统负责。
+
+### 8.1 生成修复方案
+
+```python
+from bughunter import propose_fix
+
+proposal = propose_fix(stack_trace, repo_path="/path/to/repo")
+for edit in proposal.edits:
+    print(edit.path, edit.action, edit.rationale)
+```
+
+`propose_fix()` 只读检索代码并返回 `FixProposal`，不会修改文件。
+
+### 8.2 应用已确认的修改
+
+```python
+from bughunter import apply_edits
+
+result = apply_edits(proposal, repo_path="/path/to/repo")
+print(result.applied)
+print(result.backup_path)
+```
+
+`apply_edits()` 使用 `old_string` 唯一匹配和 `new_string` 替换；新增文件使用 `action="create"`。应用成功后会生成备份目录，写入失败会尝试回滚已写文件。
+
+如果需要人工回滚，可使用 `restore_backup()`：
+
+```python
+from bughunter import restore_backup
+
+restore_backup(repo_path="/path/to/repo", backup_path=result.backup_path)
+```
+
+`restore_backup()` 会恢复被修改文件，并按备份 manifest 删除本次新增文件。
+
+### 8.3 生成测试方案
+
+```python
+from bughunter import Settings, generate_tests
+
+settings = Settings(
+    base_url="http://10.0.0.5:8000/v1",
+    model="qwen2.5-coder",
+    system_context="系统通过 python -m unittest 运行单元测试。",
+)
+tests = generate_tests(repo_path="/path/to/repo", proposal=proposal, settings=settings)
+```
+
+`generate_tests()` 同样只读检索代码并返回 `TestProposal`，不会修改文件。
+
+### 8.4 执行白名单命令
+
+```python
+from bughunter import Settings, run_command
+
+settings = Settings(
+    base_url="http://10.0.0.5:8000/v1",
+    model="qwen2.5-coder",
+    allowed_commands={"test": ["python", "-m", "unittest"]},
+)
+result = run_command("test", repo_path="/path/to/repo", settings=settings)
+print(result.exit_code)
+print(result.stdout)
+```
+
+`run_command()` 只接受 `Settings.allowed_commands` 中声明的命令名，
+内部使用 `subprocess.Popen(..., shell=False)` 执行，
+并分块读取 stdout / stderr，避免大输出完整进入内存或临时文件。
+
+### 8.5 应用并测试
+
+```python
+from bughunter import apply_and_test
+
+result = apply_and_test(proposal, repo_path="/path/to/repo", settings=settings)
+print(result.apply_result.applied)
+print(result.command_result.exit_code if result.command_result else None)
+```
+
+`apply_and_test()` 先应用修改；如果应用阶段失败，会抛出错误且不会运行测试。
+
+### 8.6 CLI 子命令
+
+```bash
+# 分析报错，输出 JSON
+python -m bughunter analyze --repo /path/to/repo --stack-file trace.txt
+
+# 生成修复方案，输出 FixProposal JSON
+python -m bughunter propose-fix --repo /path/to/repo --stack-file trace.txt
+
+# 应用已确认的 proposal
+python -m bughunter apply --repo /path/to/repo --proposal fix.json
+
+# 执行白名单命令
+python -m bughunter run --repo /path/to/repo --name test
+```
+
+CLI 只作为库接口的薄包装，不包含交互式确认。
+
+### 8.7 相关环境变量
+
+| 环境变量 | 说明 |
+| --- | --- |
+| `BUGHUNTER_ALLOWED_COMMANDS` | JSON 对象，例如 `{"test": ["python", "-m", "unittest"]}` |
+| `BUGHUNTER_COMMAND_TIMEOUT` | 命令超时秒数，默认 `300` |
+| `BUGHUNTER_SYSTEM_CONTEXT` | 传给 `generate_tests()` 的系统启动 / 集成测试说明 |
+
 ## 参考来源
 
 - OpenAI Function calling 文档：<https://platform.openai.com/docs/guides/function-calling>
+- Python `subprocess.Popen`：<https://docs.python.org/3/library/subprocess.html#subprocess.Popen>
+- Python `difflib.unified_diff`：<https://docs.python.org/3/library/difflib.html#difflib.unified_diff>

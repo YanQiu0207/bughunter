@@ -1,10 +1,22 @@
-"""schema.build_result 的单元测试。"""
+"""schema build 函数的单元测试。"""
 
 from __future__ import annotations
 
 import unittest
 
-from bughunter.schema import AnalysisResult, ResultParseError, build_result
+from bughunter.schema import (
+    AnalysisResult,
+    FixProposal,
+    ResultParseError,
+    build_fix_proposal,
+    build_result,
+    build_test_proposal,
+)
+from bughunter import (
+    ResultParseError as PublicResultParseError,
+    build_fix_proposal as public_build_fix_proposal,
+    build_test_proposal as public_build_test_proposal,
+)
 
 _VALID_ARGS: dict = {
     "summary": "KeyError：缺少 user 键",
@@ -23,8 +35,29 @@ _VALID_ARGS: dict = {
     ],
 }
 
+_VALID_FIX_ARGS = {
+    "summary": "修复 KeyError",
+    "edits": [
+        {
+            "path": "app.py",
+            "action": "edit",
+            "old_string": "return d['user']",
+            "new_string": "return d.get('user')",
+            "rationale": "避免缺键异常。",
+        }
+    ],
+    "confidence": "high",
+}
+
 
 class BuildResultTest(unittest.TestCase):
+    def test_result_parse_error_exported_from_package(self) -> None:
+        self.assertIs(PublicResultParseError, ResultParseError)
+
+    def test_proposal_builders_exported_from_package(self) -> None:
+        self.assertIs(public_build_fix_proposal, build_fix_proposal)
+        self.assertIs(public_build_test_proposal, build_test_proposal)
+
     def test_valid_args_returns_analysis_result(self) -> None:
         result = build_result(_VALID_ARGS)
         self.assertIsInstance(result, AnalysisResult)
@@ -65,6 +98,61 @@ class BuildResultTest(unittest.TestCase):
     def test_empty_code_references_allowed(self) -> None:
         result = build_result({**_VALID_ARGS, "code_references": []})
         self.assertEqual(result.code_references, [])
+
+
+class BuildProposalTest(unittest.TestCase):
+    def test_build_fix_proposal_valid(self) -> None:
+        result = build_fix_proposal(_VALID_FIX_ARGS)
+        self.assertIsInstance(result, FixProposal)
+        self.assertEqual(result.edits[0].action, "edit")
+
+    def test_build_test_proposal_accepts_create(self) -> None:
+        args = {
+            **_VALID_FIX_ARGS,
+            "edits": [
+                {
+                    "path": "tests/test_app.py",
+                    "action": "create",
+                    "old_string": "",
+                    "new_string": "def test_x():\n    pass\n",
+                    "rationale": "新增测试。",
+                }
+            ],
+        }
+        result = build_test_proposal(args)
+        self.assertEqual(result.edits[0].action, "create")
+
+    def test_invalid_action_raises(self) -> None:
+        args = {
+            **_VALID_FIX_ARGS,
+            "edits": [{**_VALID_FIX_ARGS["edits"][0], "action": "delete"}],
+        }
+        with self.assertRaises(ResultParseError):
+            build_fix_proposal(args)
+
+    def test_edit_requires_old_string(self) -> None:
+        args = {
+            **_VALID_FIX_ARGS,
+            "edits": [{**_VALID_FIX_ARGS["edits"][0], "old_string": ""}],
+        }
+        with self.assertRaises(ResultParseError):
+            build_fix_proposal(args)
+
+    def test_create_requires_empty_old_string(self) -> None:
+        args = {
+            **_VALID_FIX_ARGS,
+            "edits": [
+                {
+                    "path": "tests/test_app.py",
+                    "action": "create",
+                    "old_string": "not-empty",
+                    "new_string": "x",
+                    "rationale": "新增测试。",
+                }
+            ],
+        }
+        with self.assertRaises(ResultParseError):
+            build_test_proposal(args)
 
 
 if __name__ == "__main__":

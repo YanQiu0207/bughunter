@@ -21,6 +21,7 @@ MAX_LIST_ENTRIES = 300
 _SKIP_DIRS = {
     ".git", ".hg", ".svn", "__pycache__", "node_modules",
     ".venv", "venv", ".idea", ".vscode", "dist", "build", ".mypy_cache",
+    ".bughunter_backups",
 }
 _BINARY_EXT = {
     ".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".zip", ".gz",
@@ -50,10 +51,20 @@ class CodeTools:
             raise SandboxError(f"路径越界，拒绝访问：{rel!r}")
         return target
 
+    def _has_skipped_part(self, target: Path) -> bool:
+        """检查目标路径是否落在工具应跳过的目录下。"""
+        try:
+            rel = target.relative_to(self.root)
+        except ValueError:
+            return False
+        return any(part in _SKIP_DIRS for part in rel.parts)
+
     # -- 工具 --------------------------------------------------------------- #
 
     def read_file(self, path: str, start: int | None = None, end: int | None = None) -> str:
         target = self._resolve(path)
+        if self._has_skipped_part(target):
+            return f"[跳过] 路径位于忽略目录中：{path}"
         if not target.is_file():
             return f"[错误] 文件不存在或不是文件：{path}"
         try:
@@ -131,6 +142,8 @@ class CodeTools:
 
     def list_dir(self, path: str | None = None) -> str:
         target = self._resolve(path or ".")
+        if self._has_skipped_part(target):
+            return f"[跳过] 路径位于忽略目录中：{path}"
         if not target.is_dir():
             return f"[错误] 不是目录：{path}"
         entries = []

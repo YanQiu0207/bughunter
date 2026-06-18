@@ -6,7 +6,7 @@
 - **自写极简工具循环**：约 120 行 function-calling 循环，源码全在项目内、可随意修改，不当 pip 黑盒。
 - **支持多种大模型**：走 OpenAI 兼容协议，切换 DeepSeek、通义千问、内网自托管模型只改 `base_url + model`。
 - **可替换 LLM 实现**：用 `Protocol` 做防腐层，底层可整体替换而不动核心逻辑。
-- **只读沙箱**：检索限制在仓库目录内、不执行任何命令。
+- **默认只读沙箱**：检索限制在仓库目录内；仅显式调用 `run_command()` 时执行白名单命令。
 
 ## 快速开始
 
@@ -50,6 +50,19 @@ python -m unittest discover -s tests
 
 - [设计文档](docs/design.md)：架构、工具循环机制、防腐层、安全沙箱、选型说明。
 - [使用文档](docs/usage.md)：配置、模块调用、命令行、切换模型、内网部署。
+
+## 闭环能力
+
+除现有 `analyze()` 外，`bughunter` 还提供「修复 - 应用 - 测试」闭环接口：
+
+- `propose_fix()`：只读检索代码，返回 `FixProposal`，不落盘。
+- `generate_tests()`：只读检索代码，返回 `TestProposal`，不落盘。
+- `apply_edits()`：在人工确认后确定性应用修改，带沙箱校验、备份和失败回滚。
+- `restore_backup()`：按 `apply_edits()` 返回的备份路径恢复文件，并清理本次新建文件。
+- `run_command()`：只执行 `Settings.allowed_commands` 中声明的白名单命令。
+- `apply_and_test()`：组合执行 `apply_edits()` 与白名单测试命令。
+
+流程编排由调用方系统负责：库只返回结构化结果，不做人工确认、不直接交互。
 
 ## 要求
 

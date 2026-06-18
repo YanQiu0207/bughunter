@@ -1,11 +1,23 @@
-"""report.to_markdown / to_dict 的单元测试。"""
+"""report 渲染与序列化测试。"""
 
 from __future__ import annotations
 
 import unittest
 
-from bughunter.report import to_dict, to_markdown
-from bughunter.schema import AnalysisResult, CodeReference, Suggestion
+from bughunter.report import (
+    command_result_to_markdown,
+    fix_proposal_to_markdown,
+    to_dict,
+    to_markdown,
+)
+from bughunter.schema import (
+    AnalysisResult,
+    CodeReference,
+    CommandResult,
+    FileEdit,
+    FixProposal,
+    Suggestion,
+)
 
 _REF = CodeReference(file="app.py", line_start=1, line_end=2, excerpt="def f():\n    pass")
 _SUG = Suggestion(title="改用 .get", detail="用 d.get('user', {})", code_refs=[])
@@ -55,13 +67,13 @@ class ToMarkdownTest(unittest.TestCase):
 
 class ToDictTest(unittest.TestCase):
     def test_returns_dict(self) -> None:
-        d = to_dict(_RESULT)
-        self.assertIsInstance(d, dict)
+        result_dict = to_dict(_RESULT)
+        self.assertIsInstance(result_dict, dict)
 
     def test_all_top_level_fields_present(self) -> None:
-        d = to_dict(_RESULT)
+        result_dict = to_dict(_RESULT)
         for key in ("summary", "root_cause", "confidence", "suggestions", "code_references"):
-            self.assertIn(key, d)
+            self.assertIn(key, result_dict)
 
     def test_confidence_value_preserved(self) -> None:
         self.assertEqual(to_dict(_RESULT)["confidence"], "high")
@@ -70,6 +82,34 @@ class ToDictTest(unittest.TestCase):
         refs = to_dict(_RESULT)["code_references"]
         self.assertEqual(len(refs), 1)
         self.assertEqual(refs[0]["file"], "app.py")
+
+
+class ProposalMarkdownTest(unittest.TestCase):
+    def test_fix_proposal_contains_diff(self) -> None:
+        proposal = FixProposal(
+            summary="修复缺键",
+            edits=[
+                FileEdit(
+                    path="app.py",
+                    action="edit",
+                    old_string="return d['user']\n",
+                    new_string="return d.get('user')\n",
+                    rationale="避免 KeyError。",
+                )
+            ],
+            confidence="high",
+        )
+        md = fix_proposal_to_markdown(proposal)
+        self.assertIn("```diff", md)
+        self.assertIn("-return d['user']", md)
+        self.assertIn("+return d.get('user')", md)
+
+    def test_command_result_markdown_contains_stdout(self) -> None:
+        md = command_result_to_markdown(
+            CommandResult(name="test", exit_code=0, stdout="ok", stderr="")
+        )
+        self.assertIn("stdout", md)
+        self.assertIn("ok", md)
 
 
 if __name__ == "__main__":

@@ -6,10 +6,13 @@ import os
 import unittest
 
 from bughunter.config import (
+    ENV_ALLOWED_COMMANDS,
     ENV_API_KEY,
     ENV_BASE_URL,
+    ENV_COMMAND_TIMEOUT,
     ENV_MAX_RETRIES,
     ENV_MODEL,
+    ENV_SYSTEM_CONTEXT,
     ENV_TIMEOUT,
     Settings,
 )
@@ -54,18 +57,40 @@ class SettingsInitTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             Settings(base_url="http://localhost/v1", model="m", max_retries=-1)
 
+    def test_allowed_commands_default_empty(self) -> None:
+        s = Settings(base_url="http://localhost/v1", model="m")
+        self.assertEqual(s.allowed_commands, {})
+        self.assertEqual(s.command_timeout, 300.0)
+
+    def test_invalid_allowed_commands_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            Settings(
+                base_url="http://localhost/v1",
+                model="m",
+                allowed_commands={"test": []},
+            )
+
 
 class SettingsFromEnvTest(unittest.TestCase):
     def _set_env(self, **kwargs: str) -> None:
-        for k, v in kwargs.items():
-            os.environ[k] = v
+        for key, value in kwargs.items():
+            os.environ[key] = value
 
     def _del_env(self, *keys: str) -> None:
-        for k in keys:
-            os.environ.pop(k, None)
+        for key in keys:
+            os.environ.pop(key, None)
 
     def tearDown(self) -> None:
-        self._del_env(ENV_BASE_URL, ENV_MODEL, ENV_API_KEY, ENV_TIMEOUT, ENV_MAX_RETRIES)
+        self._del_env(
+            ENV_BASE_URL,
+            ENV_MODEL,
+            ENV_API_KEY,
+            ENV_TIMEOUT,
+            ENV_MAX_RETRIES,
+            ENV_ALLOWED_COMMANDS,
+            ENV_COMMAND_TIMEOUT,
+            ENV_SYSTEM_CONTEXT,
+        )
 
     def test_from_env_valid(self) -> None:
         self._set_env(
@@ -114,7 +139,11 @@ class SettingsFromEnvTest(unittest.TestCase):
 
     def test_from_env_invalid_timeout_raises(self) -> None:
         self._set_env(
-            **{ENV_BASE_URL: "http://localhost/v1", ENV_MODEL: "m", ENV_TIMEOUT: "abc"}
+            **{
+                ENV_BASE_URL: "http://localhost/v1",
+                ENV_MODEL: "m",
+                ENV_TIMEOUT: "abc",
+            }
         )
         with self.assertRaises(RuntimeError) as ctx:
             Settings.from_env()
@@ -148,6 +177,33 @@ class SettingsFromEnvTest(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             Settings.from_env()
         self.assertIn(ENV_MAX_RETRIES, str(ctx.exception))
+
+    def test_from_env_allowed_commands_json(self) -> None:
+        self._set_env(
+            **{
+                ENV_BASE_URL: "http://localhost/v1",
+                ENV_MODEL: "m",
+                ENV_ALLOWED_COMMANDS: '{"test": ["python", "-m", "unittest"]}',
+                ENV_COMMAND_TIMEOUT: "12.5",
+                ENV_SYSTEM_CONTEXT: "run tests",
+            }
+        )
+        s = Settings.from_env()
+        self.assertEqual(s.allowed_commands["test"], ["python", "-m", "unittest"])
+        self.assertEqual(s.command_timeout, 12.5)
+        self.assertEqual(s.system_context, "run tests")
+
+    def test_command_from_env_does_not_require_llm_env(self) -> None:
+        self._set_env(
+            **{
+                ENV_ALLOWED_COMMANDS: '{"test": ["python", "-V"]}',
+                ENV_BASE_URL: "not-a-url",
+            }
+        )
+        s = Settings.command_from_env()
+        self.assertEqual(s.model, "command-runner")
+        self.assertEqual(s.base_url, "http://localhost/v1")
+        self.assertEqual(s.allowed_commands["test"], ["python", "-V"])
 
 
 if __name__ == "__main__":

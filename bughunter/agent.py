@@ -1,23 +1,29 @@
-"""Agent 核心：OpenAI 兼容 function-calling 工具循环 + analyze() 入口。
-
-循环只依赖 LLMClient 接口（防腐层），不感知具体厂商。模型通过反复调用
-read_file/grep_code/list_dir 在仓库里定位代码，最终调用 submit_analysis 收口。
-"""
+"""Agent 阶段入口：分析、修复提案与测试提案。"""
 
 from __future__ import annotations
 
 import json
+import os
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
-from .config import Settings
-from .llm import ChatResponse, LLMClient, UrllibOpenAIClient
+from .config import ENV_SYSTEM_CONTEXT, Settings
+from .llm import LLMClient, UrllibOpenAIClient
+from .loop import MaxStepsExceeded, run_tool_loop
 from .schema import (
+    FIX_TOOL_SCHEMAS,
+    TEST_TOOL_SCHEMAS,
     TOOL_SCHEMAS,
     TOOL_SUBMIT,
+    TOOL_SUBMIT_FIX,
+    TOOL_SUBMIT_TESTS,
     AnalysisResult,
-    ResultParseError,
+    FixProposal,
+    TestProposal,
+    build_fix_proposal,
     build_result,
+    build_test_proposal,
 )
 from .tools import CodeTools
 
@@ -34,30 +40,39 @@ SYSTEM_PROMPT = """\
 
 注意：所有文件路径都相对仓库根目录。工具结果可能被截断，必要时缩小范围再读。"""
 
+FIX_PROMPT = """\
+你是一名资深的软件修复专家。用户会给你一段报错堆栈，以及一个可供你只读检索的代码仓库。
 
-class MaxStepsExceeded(RuntimeError):
-    """在 max_steps 内模型仍未调用 submit_analysis 收口。"""
+工作要求：
+1. 先用 grep_code / read_file / list_dir 定位真实代码，严禁不看代码就给修改。
+2. 只产出修复方案，不要声称已经修改文件。
+3. 每个修改必须使用 old_string 唯一匹配 + new_string 替换；新增文件使用 action=create 且 old_string 为空。
+4. 修改块要尽量小，方便人工确认和确定性应用。
+5. 最终必须调用 submit_fix 工具提交结构化修复方案。"""
+
+TEST_PROMPT = """\
+你是一名资深的软件测试工程师。你需要在只读检索仓库后，为修复方案生成回归测试或集成测试文件方案。
+
+工作要求：
+1. 先用 grep_code / read_file / list_dir 查看现有测试风格和项目结构。
+2. 只产出测试修改方案，不要声称已经修改文件。
+3. 每个修改必须使用 old_string 唯一匹配 + new_string 替换；新增文件使用 action=create 且 old_string 为空。
+4. 测试应覆盖修复的关键路径。
+5. 最终必须调用 submit_tests 工具提交结构化测试方案。"""
 
 
-def _assistant_message(resp: ChatResponse) -> dict[str, Any]:
-    """把中立响应还原成 OpenAI 格式的 assistant 消息，供下一轮请求携带。"""
-    msg: dict[str, Any] = {
-        "role": "assistant",
-        "content": resp.content or "",
-    }
-    if resp.tool_calls:
-        msg["tool_calls"] = [
-            {
-                "id": tc.id,
-                "type": "function",
-                "function": {
-                    "name": tc.name,
-                    "arguments": json.dumps(tc.arguments, ensure_ascii=False),
-                },
-            }
-            for tc in resp.tool_calls
-        ]
-    return msg
+def _build_llm(settings: Settings | None, llm: LLMClient | None) -> LLMClient:
+    if llm is not None:
+        return llm
+    return UrllibOpenAIClient(settings or Settings.from_env())
+
+
+def _json_context(value: Any) -> str:
+    if value is None:
+        return ""
+    if is_dataclass(value):
+        return json.dumps(asdict(value), ensure_ascii=False, indent=2)
+    return json.dumps(value, ensure_ascii=False, indent=2)
 
 
 def analyze(
@@ -68,17 +83,7 @@ def analyze(
     llm: LLMClient | None = None,
     max_steps: int = 12,
 ) -> AnalysisResult:
-    """分析报错堆栈，返回结构化的根因与建议。
-
-    :param stack_trace: 报错堆栈文本。
-    :param repo_path: 可供检索的代码仓库根目录。
-    :param settings: 运行配置；省略则从环境变量读取（仅在需要构造默认 llm 时使用）。
-    :param llm: LLM 客户端（防腐层注入点）；省略则用 UrllibOpenAIClient(settings)。
-    :param max_steps: 工具循环最大轮数，防止失控。
-    """
-    if llm is None:
-        llm = UrllibOpenAIClient(settings or Settings.from_env())
-
+    """分析报错堆栈，返回结构化的根因与建议。"""
     tools = CodeTools(repo_path)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -90,57 +95,95 @@ def analyze(
             ),
         },
     ]
+    return run_tool_loop(
+        llm=_build_llm(settings, llm),
+        messages=messages,
+        tools=TOOL_SCHEMAS,
+        submit_tool_name=TOOL_SUBMIT,
+        build_fn=build_result,
+        dispatcher=tools.dispatch,
+        max_steps=max_steps,
+        nudge_message="请在查看代码后调用 submit_analysis 工具提交结构化结论。",
+    )
 
-    for _ in range(max_steps):
-        resp = llm.chat(messages, tools=TOOL_SCHEMAS, tool_choice="auto")
 
-        if not resp.tool_calls:
-            # 模型没调工具也没收口，明确要求它用 submit_analysis 提交
-            messages.append(_assistant_message(resp))
-            messages.append(
-                {
-                    "role": "user",
-                    "content": "请在查看代码后调用 submit_analysis 工具提交结构化结论。",
-                }
-            )
-            continue
+def propose_fix(
+    stack_trace: str,
+    repo_path: str | Path,
+    *,
+    analysis: AnalysisResult | dict[str, Any] | None = None,
+    test_output: str | None = None,
+    settings: Settings | None = None,
+    llm: LLMClient | None = None,
+    max_steps: int = 12,
+) -> FixProposal:
+    """只读检索仓库并产出修复方案，不落盘。"""
+    tools = CodeTools(repo_path)
+    context_parts = [
+        "请基于下面的报错堆栈生成修复方案。",
+        "",
+        "=== 报错堆栈 ===",
+        stack_trace.strip(),
+    ]
+    if analysis is not None:
+        context_parts.extend(["", "=== 已有分析结果 ===", _json_context(analysis)])
+    if test_output:
+        context_parts.extend(["", "=== 上一轮测试输出 ===", test_output.strip()])
 
-        messages.append(_assistant_message(resp))
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": FIX_PROMPT},
+        {"role": "user", "content": "\n".join(context_parts)},
+    ]
+    return run_tool_loop(
+        llm=_build_llm(settings, llm),
+        messages=messages,
+        tools=FIX_TOOL_SCHEMAS,
+        submit_tool_name=TOOL_SUBMIT_FIX,
+        build_fn=build_fix_proposal,
+        dispatcher=tools.dispatch,
+        max_steps=max_steps,
+        nudge_message="请在查看代码后调用 submit_fix 工具提交结构化修复方案。",
+    )
 
-        # 先执行所有普通工具，再处理 submit_analysis，保证消息历史完整。
-        # OpenAI 协议要求 assistant 声明的每个 tool_call_id 都有对应 tool 消息。
-        submit_tc = None
-        for tc in resp.tool_calls:
-            if tc.name == TOOL_SUBMIT:
-                submit_tc = tc
-            else:
-                result = tools.dispatch(tc.name, tc.arguments)
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": result,
-                    }
-                )
-        if submit_tc is not None:
-            # 补齐 submit 的 tool 消息，保证历史完整（防止 build_result 异常时重入循环发出非法请求）
-            try:
-                return build_result(submit_tc.arguments)
-            except ResultParseError as exc:
-                # 提交的参数不符合 schema：把错误回灌给模型，让其修正后重新提交，
-                # 而非直接中断整个分析。受 max_steps 兜底，不会无限循环。
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": submit_tc.id,
-                        "content": (
-                            f"[提交失败] {exc}。"
-                            "请检查参数是否符合 submit_analysis 的 schema 后重新调用。"
-                        ),
-                    }
-                )
-                continue
 
-    raise MaxStepsExceeded(
-        f"已达到 max_steps={max_steps}，模型仍未调用 {TOOL_SUBMIT} 收口"
+def generate_tests(
+    repo_path: str | Path,
+    *,
+    proposal: FixProposal | TestProposal | dict[str, Any] | None = None,
+    settings: Settings | None = None,
+    llm: LLMClient | None = None,
+    max_steps: int = 12,
+) -> TestProposal:
+    """只读检索仓库并产出测试文件方案，不落盘。"""
+    effective_settings = settings
+    if effective_settings is None and llm is None:
+        try:
+            effective_settings = Settings.from_env()
+        except RuntimeError:
+            raise
+    system_context = (
+        effective_settings.system_context
+        if effective_settings
+        else os.environ.get(ENV_SYSTEM_CONTEXT, "")
+    )
+    context_parts = ["请为当前修复生成回归测试或集成测试方案。"]
+    if proposal is not None:
+        context_parts.extend(["", "=== 修复方案 ===", _json_context(proposal)])
+    if system_context:
+        context_parts.extend(["", "=== 系统启动 / 集成测试说明 ===", system_context])
+
+    tools = CodeTools(repo_path)
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": TEST_PROMPT},
+        {"role": "user", "content": "\n".join(context_parts)},
+    ]
+    return run_tool_loop(
+        llm=_build_llm(effective_settings, llm),
+        messages=messages,
+        tools=TEST_TOOL_SCHEMAS,
+        submit_tool_name=TOOL_SUBMIT_TESTS,
+        build_fn=build_test_proposal,
+        dispatcher=tools.dispatch,
+        max_steps=max_steps,
+        nudge_message="请在查看代码后调用 submit_tests 工具提交结构化测试方案。",
     )

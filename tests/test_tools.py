@@ -64,6 +64,22 @@ class CodeToolsTest(unittest.TestCase):
         self.assertIn("pkg/", out)
         self.assertIn("README.md", out)
 
+    def test_grep_and_list_skip_bughunter_backups(self) -> None:
+        backup = self.root / ".bughunter_backups" / "20260618"
+        backup.mkdir(parents=True)
+        (backup / "old.py").write_text("SECRET_BACKUP_MARKER\n", encoding="utf-8")
+
+        grep_out = self.tools.grep_code("SECRET_BACKUP_MARKER")
+        list_out = self.tools.list_dir(".")
+        explicit_list = self.tools.list_dir(".bughunter_backups")
+        explicit_read = self.tools.read_file(".bughunter_backups/20260618/old.py")
+
+        self.assertIn("[无命中]", grep_out)
+        self.assertNotIn(".bughunter_backups", grep_out)
+        self.assertNotIn(".bughunter_backups", list_out)
+        self.assertIn("[跳过]", explicit_list)
+        self.assertIn("[跳过]", explicit_read)
+
     def test_sandbox_blocks_parent_escape(self) -> None:
         with self.assertRaises(SandboxError):
             self.tools.read_file("../outside.txt")

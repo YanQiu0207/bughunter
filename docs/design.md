@@ -18,7 +18,11 @@ bughunter 解决一个具体问题：把一段报错堆栈交给大模型，让�
                 analyze(stack_trace, repo_path)
                             │
               ┌─────────────┴─────────────┐
-              │        agent.py           │   工具循环（只依赖 LLMClient 接口）
+              │        agent.py           │   阶段入口
+              └─────────────┬─────────────┘
+                            │
+              ┌─────────────▼─────────────┐
+              │        loop.py            │   通用工具循环（只依赖 LLMClient 接口）
               └──────┬─────────────┬──────┘
                      │             │
           ┌──────────▼───┐   ┌─────▼──────────┐
@@ -39,13 +43,16 @@ bughunter 解决一个具体问题：把一段报错堆栈交给大模型，让�
 
 | 模块 | 职责 |
 | --- | --- |
-| `config.py` | `Settings`：端点、模型、超时、重试次数等配置；参数优先，否则读环境变量 |
-| `schema.py` | 结构化结果 `dataclasses` + 所有工具的 JSON Schema 常量 + `build_result` 校验 |
-| `llm.py` | 防腐层：`LLMClient` 接口、中立响应模型、默认实现 `UrllibOpenAIClient` |
+| `config.py` | `Settings`：LLM 端点、重试、命令白名单、命令超时、系统上下文 |
+| `schema.py` | 分析、修复、测试、应用与命令结果模型，以及工具 JSON Schema |
+| `llm.py` | 防腐层：`LLMClient` 接口、中立响应模型、默认 OpenAI 兼容实现 |
 | `tools.py` | `read_file` / `grep_code` / `list_dir`，纯标准库实现 + 仓库沙箱 |
-| `agent.py` | 工具循环 + `analyze()` 入口 |
-| `report.py` | 把 `AnalysisResult` 渲染成 Markdown 报告，或转 dict |
-| `cli.py` | 命令行入口 |
+| `loop.py` | 通用 function-calling 工具循环，供分析、修复提案、测试提案复用 |
+| `agent.py` | 阶段入口：`analyze()`、`propose_fix()`、`generate_tests()` |
+| `patch.py` | 确定性应用 `FileEdit`，提供备份、失败回滚、`restore_backup()` 与 `apply_and_test()` |
+| `runner.py` | 白名单命令执行，禁止 `shell=True`，限制输出与超时 |
+| `report.py` | 渲染分析报告、修复 / 测试方案、命令结果，或转 dict |
+| `cli.py` | 命令行入口；旧模式兼容 Markdown，新子命令输出 JSON |
 
 ## 3. 核心机制：function-calling 工具循环
 
@@ -61,18 +68,17 @@ messages = [system, user(报错堆栈)]
     把 assistant（带 tool_calls）追加进 messages
     先执行所有普通工具，结果以 role=tool 回灌：
         对每个 tool_call：
-            若是 submit_analysis：暂存，不立即执行（保证消息历史完整）
+            若是 submit_analysis：暂存，稍后作为收口工具处理
             否则执行 dispatch(read_file / grep_code / list_dir)
             把工具结果以 role=tool 追加进 messages
     若有暂存的 submit_analysis：
-        补齐它的 role=tool 消息（防重入时历史非法）
         尝试 build_result(arguments)
         成功 → return 结构化结果
         失败（参数不符合 schema）→ 把错误信息以 role=tool 回灌，continue 让模型修正后重新提交
 超过 max_steps 仍未收口 → 抛 MaxStepsExceeded
 ```
 
-对应实现见 `bughunter/agent.py` 的 `analyze()`。
+对应实现见 `bughunter/loop.py` 的 `run_tool_loop()`。
 
 > function calling 协议（`tools` / `tool_calls` 的请求与响应格式）来源：OpenAI 官方文档 [Function calling](https://platform.openai.com/docs/guides/function-calling)。
 
@@ -153,9 +159,9 @@ class LLMClient(Protocol):
 
 重试仅作用于 `_post`（HTTP 层），不影响 `agent.py` 的工具循环逻辑；防腐层接口 `LLMClient.chat` 的契约不变，替换实现可自行决定是否重试。
 
-### 6.2 提交失败重入（`agent.py`）
+### 6.2 提交失败重入（`loop.py`）
 
-模型调用 `submit_analysis` 时，其 `arguments` 偶尔会缺字段或类型不符。`build_result` 在此情况下抛 `ResultParseError`。此时不直接中断整个分析，而是：
+模型调用 `submit_analysis`、`submit_fix` 或 `submit_tests` 时，其 `arguments` 偶尔会缺字段或类型不符。对应的 `build_*` 函数在此情况下抛 `ResultParseError`。此时 `run_tool_loop()` 不直接中断当前阶段，而是：
 
 1. 为 `submit_tc` 补齐 `role=tool` 消息（内容为错误提示，而非 "submitted"），保证消息历史合法；
 2. `continue` 回到循环顶部，让模型看到错误反馈后修正参数、重新提交。
@@ -180,8 +186,35 @@ class LLMClient(Protocol):
   - `tests/test_agent.py`：注入 `FakeLLMClient` 脚本化 `grep_code → read_file → submit_analysis`，断言循环正确分发工具、工具结果回灌、无工具调用时催促收口、`max_steps` 超限抛错。
 - **端到端**：配好真实（含内网）端点，对一个小仓库 + 真实堆栈跑 `analyze()`，人工核对根因是否定位到正确 `file:line`、建议是否合理。
 
+## 9. 闭环能力演进
+
+在保持 `analyze()` 默认只读行为不变的前提下，项目新增了「修复 - 应用 - 测试」闭环能力。新的阶段接口与 `analyze()` 并列：
+
+| 接口 | 是否调用 LLM | 是否写盘 / 执行命令 | 说明 |
+| --- | --- | --- | --- |
+| `propose_fix()` | 是 | 否 | 只读检索代码，返回 `FixProposal` |
+| `generate_tests()` | 是 | 否 | 只读检索代码，返回 `TestProposal` |
+| `apply_edits()` | 否 | 写盘 | 人工确认后确定性应用 `FileEdit` |
+| `restore_backup()` | 否 | 写盘 | 根据备份 manifest 恢复修改并删除本次新增文件 |
+| `run_command()` | 否 | 执行命令 | 仅执行 `Settings.allowed_commands` 白名单命令 |
+| `apply_and_test()` | 否 | 写盘 + 执行命令 | 先应用修改，成功后运行测试命令 |
+
+闭环编排由调用方系统负责。例如：调用方系统先调用 `propose_fix()` 拿到方案，交给程序员确认；确认后再调用 `apply_and_test()` 应用代码并执行测试。本库不负责人工确认，也不做交互式提示。
+
+### 9.1 安全模型演进
+
+| 能力 | 默认状态 | 约束 |
+| --- | --- | --- |
+| 读代码 | 开启 | 沿用 `CodeTools` 的仓库沙箱 |
+| 写盘 | 仅显式调用 | 路径沙箱、`old_string` 唯一匹配、`create` 不覆盖、备份 / 回滚 |
+| 执行命令 | 仅显式调用 | 白名单 `argv`、`shell=False`、`cwd` 锁定仓库、超时控制 |
+
+模型始终不能直接写盘或执行命令：LLM 阶段只产出结构化方案；落盘与命令执行由确定性代码完成。
+
 ## 参考来源
 
 - OpenAI Function calling 文档（`tools` / `tool_calls` 协议）：<https://platform.openai.com/docs/guides/function-calling>
 - Python `typing.Protocol`（结构化子类型）：<https://docs.python.org/3/library/typing.html#typing.Protocol>
 - Python `urllib.request`：<https://docs.python.org/3/library/urllib.request.html>
+- Python `subprocess.Popen`：<https://docs.python.org/3/library/subprocess.html#subprocess.Popen>
+- Python `difflib.unified_diff`：<https://docs.python.org/3/library/difflib.html#difflib.unified_diff>
